@@ -90,7 +90,7 @@ def load_config() -> RouterConfig:
 
 def apply_overrides(body: dict, backend: BackendServer) -> dict:
     """Return a copy of the request body with per-server overrides applied."""
-    patched = body.copy()
+    patched = {k: v for k, v in body.items() if not k.startswith("_")}
     if backend.model_override:
         patched["model"] = backend.model_override
     return patched
@@ -173,11 +173,14 @@ async def route_request(
         logger.info("Trying %s (%s) …", backend.name, backend.url)
         try:
             if streaming:
-                # Streaming — we need to return a StreamingResponse that lazily
-                # pulls from the backend.  We wrap the async generator so that
-                # errors during iteration are caught and trigger failover.
+                # Streaming — _stream_with_failover manages its own client lifecycle
+                extra_headers = {}
+                auth_header = body.pop("_auth", None)  # injected by endpoint
+                if auth_header:
+                    extra_headers["Authorization"] = auth_header
                 stream_gen = _stream_with_failover(
-                    client, list(cfg.backends), body, start_idx=list(cfg.backends).index(backend)
+                    list(cfg.backends), body, start_idx=list(cfg.backends).index(backend),
+                    extra_headers=extra_headers or None,
                 )
                 return (
                     StreamingResponse(
@@ -243,30 +246,38 @@ async def route_request(
 
 
 async def _stream_with_failover(
-    client: httpx.AsyncClient,
     backends: list[BackendServer],
     body: dict,
     start_idx: int,
+    extra_headers: dict | None = None,
 ):
-    """Async generator that tries streaming from *start_idx* onward."""
-    for i in range(start_idx, len(backends)):
-        backend = backends[i]
-        logger.info("Streaming from %s (%s) …", backend.name, backend.url)
-        try:
-            async for chunk in proxy_streaming(client, backend, body):
-                yield chunk
-            return  # success — exit
-        except httpx.TimeoutException:
-            logger.warning("Timeout streaming from %s, trying next …", backend.name)
-        except httpx.ConnectError as exc:
-            logger.warning("Cannot connect to %s (%s), trying next …", backend.name, exc)
-        except httpx.HTTPStatusError as exc:
-            logger.warning("HTTP error streaming from %s (%s), trying next …", backend.name, exc)
-        except Exception as exc:
-            logger.exception("Unexpected stream error with %s, trying next …", backend.name)
+    """Async generator that tries streaming from *start_idx* onward.
 
-    # Exhausted all backends during streaming — send a final error event
-    yield 'data: {"error": "All LLM backends are unavailable"}\n\n'
+    Manages its own httpx client so it stays alive for the full stream lifetime.
+    """
+    client_kwargs = {"verify": False}
+    if extra_headers:
+        client_kwargs["headers"] = extra_headers
+
+    async with httpx.AsyncClient(**client_kwargs) as client:
+        for i in range(start_idx, len(backends)):
+            backend = backends[i]
+            logger.info("Streaming from %s (%s) …", backend.name, backend.url)
+            try:
+                async for chunk in proxy_streaming(client, backend, body):
+                    yield chunk
+                return  # success — exit
+            except httpx.TimeoutException:
+                logger.warning("Timeout streaming from %s, trying next …", backend.name)
+            except httpx.ConnectError as exc:
+                logger.warning("Cannot connect to %s (%s), trying next …", backend.name, exc)
+            except httpx.HTTPStatusError as exc:
+                logger.warning("HTTP error streaming from %s (%s), trying next …", backend.name, exc)
+            except Exception as exc:
+                logger.exception("Unexpected stream error with %s, trying next …", backend.name)
+
+        # Exhausted all backends during streaming — send a final error event
+        yield 'data: {"error": "All LLM backends are unavailable"}\n\n'
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +297,11 @@ async def chat_completions(request: Request):
     extra_headers = {}
     if auth_header:
         extra_headers["Authorization"] = auth_header
+
+    # For streaming, inject auth into body so _stream_with_failover can use it
+    # (it manages its own client lifecycle to keep the connection alive)
+    if streaming and auth_header:
+        body["_auth"] = auth_header
 
     async with httpx.AsyncClient(headers=extra_headers, verify=False) as client:
         response, backend = await route_request(client, body, streaming)
