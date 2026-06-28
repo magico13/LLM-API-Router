@@ -177,7 +177,7 @@ async def route_request(
                 # pulls from the backend.  We wrap the async generator so that
                 # errors during iteration are caught and trigger failover.
                 stream_gen = _stream_with_failover(
-                    client, list(cfg.backends), body, iter_idx=list(cfg.backends).index(backend)
+                    client, list(cfg.backends), body, start_idx=list(cfg.backends).index(backend)
                 )
                 return (
                     StreamingResponse(
