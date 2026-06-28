@@ -1,0 +1,12 @@
+services:
+  llm-router:
+    build: .
+    container_name: llm-router
+    ports:
+      - "9000:8000"
+    volumes:
+      - ./data:/app/data:ro
+    # Add environment section for overrides (see README):
+    # environment:
+    #   BACKEND_0_URL: "http://192.168.68.95:1234"
+    restart: unless-stopped
