@@ -153,6 +153,46 @@ response = client.chat.completions.create(
 )
 ```
 
+## Reasoning Control
+
+The router normalizes the several incompatible ways clients express reasoning
+(thinking) control into the fields llama.cpp actually honors. This matters
+because llama.cpp's OpenAI endpoint **silently ignores**
+`thinking: {type: "disabled"}` — it only reacts to `type == "enabled"` — so
+without this translation the model reasons anyway.
+
+Any of these client dialects are accepted and translated:
+
+| Client sends | Effect |
+|---|---|
+| `thinking: {type: "disabled"}` | Reasoning off |
+| `thinking: {type: "enabled"}` | Reasoning on |
+| `thinking: {type: "enabled", budget_tokens: N}` | Reasoning on, capped at N tokens |
+| `reasoning_effort: "none"` | Reasoning off |
+| `reasoning_effort: "low" \| "medium" \| "high"` | Reasoning on at that effort |
+| `reasoning: {effort: X, max_tokens: N}` | Reasoning on at effort X, capped at N tokens |
+
+Under the hood these become llama.cpp-native fields:
+
+- `chat_template_kwargs.enable_thinking` (a JSON **boolean**) — the on/off
+  switch the model's Jinja template checks.
+- `reasoning_effort` — passed through for real effort levels.
+- `reasoning_budget_tokens` — token budget for the reasoning block.
+
+The client dialect keys (`thinking`, `reasoning`) are stripped before the
+request is forwarded, so they are not double-processed by the backend.
+
+```bash
+curl -X POST http://localhost:9000/v1/chat/completions \
+  -H "Authorization: ******" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "any-model",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "thinking": {"type": "disabled"}
+  }'
+```
+
 ## Endpoints
 
 | Method | Path | Description |

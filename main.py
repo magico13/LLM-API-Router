@@ -127,11 +127,83 @@ async def require_api_key(request: Request):
 # ---------------------------------------------------------------------------
 
 
+def normalize_reasoning(body: dict) -> dict:
+    """Translate client reasoning dialects into llama.cpp-native fields.
+
+    Clients express reasoning control in several incompatible ways. llama.cpp's
+    OpenAI endpoint only understands a subset natively, and it silently ignores
+    ``thinking: {type: "disabled"}`` (it only reacts to ``type == "enabled"``).
+    This normalizes the common dialects into the fields llama.cpp actually honors:
+
+    - ``thinking: {type: "enabled"|"disabled", budget_tokens: N}``
+    - ``reasoning: {effort: X, max_tokens: N}``
+    - ``reasoning_effort: "none"|"low"|"medium"|"high"|"xhigh"``
+
+    into:
+
+    - ``chat_template_kwargs.enable_thinking`` (JSON boolean) — the on/off switch
+      the Jinja templates actually check.
+    - ``reasoning_effort`` — passed through for real effort levels.
+    - ``reasoning_budget_tokens`` — token budget for the reasoning block.
+
+    The client dialect keys are removed so they are not forwarded (and not
+    double-processed) to the backend.
+    """
+    out = dict(body)
+    thinking = out.pop("thinking", None)
+    reasoning = out.pop("reasoning", None)
+    reasoning_effort = out.get("reasoning_effort")
+
+    enable_thinking: bool | None = None
+    budget: int | None = None
+
+    # reasoning: {effort, max_tokens}
+    if isinstance(reasoning, dict):
+        if reasoning.get("effort") is not None:
+            reasoning_effort = reasoning["effort"]
+        if reasoning.get("max_tokens") is not None:
+            budget = reasoning["max_tokens"]
+
+    # thinking: {type, budget_tokens}
+    if isinstance(thinking, dict):
+        ttype = thinking.get("type")
+        if ttype == "disabled":
+            enable_thinking = False
+        elif ttype == "enabled":
+            enable_thinking = True
+        if thinking.get("budget_tokens") is not None:
+            budget = thinking["budget_tokens"]
+
+    # reasoning_effort drives on/off and the effort level
+    if reasoning_effort is not None:
+        if reasoning_effort == "none":
+            enable_thinking = False
+            out.pop("reasoning_effort", None)
+        else:
+            enable_thinking = True
+            out["reasoning_effort"] = reasoning_effort
+
+    # Apply the on/off switch as a real JSON boolean (a string would make
+    # llama.cpp raise "invalid type for enable_thinking").
+    if enable_thinking is not None:
+        kwargs = out.get("chat_template_kwargs")
+        if not isinstance(kwargs, dict):
+            kwargs = {}
+        kwargs["enable_thinking"] = enable_thinking
+        out["chat_template_kwargs"] = kwargs
+
+    if budget is not None:
+        out["reasoning_budget_tokens"] = budget
+
+    return out
+
+
 def apply_overrides(body: dict, backend: BackendServer) -> dict:
     """Return a copy of the request body with per-server overrides applied."""
     patched = {k: v for k, v in body.items() if not k.startswith("_")}
     if backend.model_override:
         patched["model"] = backend.model_override
+    patched = normalize_reasoning(patched)
     return patched
 
 
