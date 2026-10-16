@@ -41,7 +41,8 @@ Edit [`data/config.json`](data/config.json):
     }
   ],
   "connect_timeout_seconds": 1,
-  "read_timeout_seconds": 300
+  "read_timeout_seconds": 300,
+  "api_key": "your-secret-key"
 }
 ```
 
@@ -52,6 +53,22 @@ Edit [`data/config.json`](data/config.json):
 | `model_override` | Model name to send to this backend (overrides whatever the client requests) |
 | `connect_timeout_seconds` | How long to wait for TCP connection before failing over (keep low — 1s is fine) |
 | `read_timeout_seconds` | How long to wait after connecting for the response (LLM inference can take minutes) |
+| `api_key` | Optional. If set, clients must present this key or the request is rejected with `401`. Omit or set to `null` to disable auth. |
+
+### API Key Auth
+
+When `api_key` is set, every request to `/v1/chat/completions`, `/v1/models`, and `/router/models` must present the key. The `/health` endpoint stays open for liveness probes.
+
+The key is read from the `Authorization: Bearer <key>` header (standard for OpenAI-compatible clients) or, as a fallback, the `?api_key=<key>` query string.
+
+```bash
+curl -X POST http://localhost:9000/v1/chat/completions \
+  -H "Authorization: Bearer your-secret-key" \
+  -H "Content-Type: application/json" \
+  -d '{ "model": "any", "messages": [{"role": "user", "content": "Hi"}] }'
+```
+
+> **Note:** This is a simple shared-secret gate, not a full auth system. It's fine for keeping casual strangers out of a home network, but if you expose the router to the public internet, put it behind a reverse proxy with TLS (and consider a stronger auth layer).
 
 Backends are tried **in order** — list your preferred server first.
 
@@ -67,6 +84,7 @@ You can override any config value without touching `config.json` by setting envi
 | `BACKEND_1_MODEL_OVERRIDE` | Model override for backend 1 | `your-fallback-model` |
 | `CONNECT_TIMEOUT_SECONDS` | TCP connect timeout (keep low for fast failover) | `1` |
 | `READ_TIMEOUT_SECONDS` | Read/inference timeout (LLM can take minutes) | `300` |
+| `ROUTER_API_KEY` | Override the `api_key` from config (useful for keeping the secret out of the JSON) | `your-secret-key` |
 
 Index matches the order in `config.json`. Unset vars fall back to the JSON values.
 
@@ -85,6 +103,7 @@ Point any OpenAI-compatible client at `http://<router-host>:9000/v1/chat/complet
 
 ```bash
 curl -X POST http://localhost:9000/v1/chat/completions \
+  -H "Authorization: Bearer your-secret-key" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "any-model",
@@ -96,6 +115,7 @@ curl -X POST http://localhost:9000/v1/chat/completions \
 
 ```bash
 curl -X POST http://localhost:9000/v1/chat/completions \
+  -H "Authorization: Bearer your-secret-key" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "any-model",
@@ -111,7 +131,7 @@ In your `configuration.yaml`, point the OpenAI integration at the router:
 ```yaml
 conversation:
   - platform: openai_conversation
-    api_key: "not-needed"          # or pass through if backends require it
+    api_key: "your-secret-key"     # the router's api_key (required when auth is enabled)
     model: "any"                   # overridden by the router per-backend
 ```
 
@@ -124,7 +144,7 @@ from openai import OpenAI
 
 client = OpenAI(
     base_url="http://localhost:9000/v1",
-    api_key="not-needed"           # passed through to backends if present
+    api_key="your-secret-key"      # the router's api_key (required when auth is enabled)
 )
 
 response = client.chat.completions.create(

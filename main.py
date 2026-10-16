@@ -3,10 +3,11 @@
 import json
 import logging
 import os
+import secrets
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
@@ -35,6 +36,7 @@ class RouterConfig(BaseModel):
     backends: list[BackendServer]
     connect_timeout_seconds: float = 1.0
     read_timeout_seconds: float = 300.0
+    api_key: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +75,9 @@ def load_config() -> RouterConfig:
         cfg.connect_timeout_seconds = float(os.environ["CONNECT_TIMEOUT_SECONDS"])
     if os.getenv("READ_TIMEOUT_SECONDS"):
         cfg.read_timeout_seconds = float(os.environ["READ_TIMEOUT_SECONDS"])
+    if os.getenv("ROUTER_API_KEY"):
+        cfg.api_key = os.environ["ROUTER_API_KEY"]
+        logger.info("Overriding API key via ROUTER_API_KEY env var")
 
     _config_cache = cfg
     logger.info(
@@ -81,6 +86,40 @@ def load_config() -> RouterConfig:
         ", ".join(b.name for b in _config_cache.backends),
     )
     return _config_cache
+
+
+# ---------------------------------------------------------------------------
+# API key auth
+# ---------------------------------------------------------------------------
+
+
+def _extract_api_key(request: Request) -> str | None:
+    """Extract the client's API key from the Authorization header or query string."""
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return request.query_params.get("api_key")
+
+
+async def require_api_key(request: Request):
+    """Reject the request unless the API key matches the configured one.
+
+    If no API key is configured, all requests are allowed.
+    """
+    cfg = load_config()
+    if not cfg.api_key:
+        return
+
+    provided = _extract_api_key(request)
+    if provided is None or not secrets.compare_digest(provided, cfg.api_key):
+        logger.warning(
+            "Rejected request to %s — missing or invalid API key", request.url.path
+        )
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing API key",
+            headers={"WWW-Authenticate": 'Bearer realm="llm-router"'},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -287,13 +326,20 @@ async def _stream_with_failover(
 app = FastAPI(title="LLM API Router", version="1.0.0")
 
 
-@app.post("/v1/chat/completions")
+@app.post("/v1/chat/completions", dependencies=[Depends(require_api_key)])
 async def chat_completions(request: Request):
     """Proxy an OpenAI-compatible chat completion request with failover."""
     body = await request.json()
     streaming = body.get("stream", False)
 
+    # Don't forward the router's own API key to the backends — only pass
+    # through Authorization headers meant for the backend itself.
     auth_header = request.headers.get("authorization")
+    cfg = load_config()
+    if cfg.api_key and auth_header and secrets.compare_digest(
+        auth_header.removeprefix("Bearer ").strip(), cfg.api_key
+    ):
+        auth_header = None
     extra_headers = {}
     if auth_header:
         extra_headers["Authorization"] = auth_header
@@ -308,7 +354,7 @@ async def chat_completions(request: Request):
         return response
 
 
-@app.get("/v1/models")
+@app.get("/v1/models", dependencies=[Depends(require_api_key)])
 async def list_models():
     """Aggregate models from all available backends (merged, deduplicated)."""
     cfg = load_config()
@@ -340,7 +386,7 @@ async def list_models():
     return JSONResponse(content={"object": "list", "data": merged_models})
 
 
-@app.get("/router/models")
+@app.get("/router/models", dependencies=[Depends(require_api_key)])
 async def list_backends_with_models():
     """Router-aware endpoint: shows each backend and which models it serves."""
     cfg = load_config()
