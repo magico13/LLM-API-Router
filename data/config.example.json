@@ -12,5 +12,6 @@
     }
   ],
   "connect_timeout_seconds": 1,
-  "read_timeout_seconds": 300
+  "read_timeout_seconds": 300,
+  "cooldown_seconds": 300
 }

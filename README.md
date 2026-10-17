@@ -42,6 +42,7 @@ Edit [`data/config.json`](data/config.json):
   ],
   "connect_timeout_seconds": 1,
   "read_timeout_seconds": 300,
+  "cooldown_seconds": 300,
   "api_key": "your-secret-key"
 }
 ```
@@ -53,6 +54,7 @@ Edit [`data/config.json`](data/config.json):
 | `model_override` | Model name to send to this backend (overrides whatever the client requests) |
 | `connect_timeout_seconds` | How long to wait for TCP connection before failing over (keep low — 1s is fine) |
 | `read_timeout_seconds` | How long to wait after connecting for the response (LLM inference can take minutes) |
+| `cooldown_seconds` | How long to skip a backend after a connection-level failure before retrying it (see [Sticky failover](#sticky-failover)) |
 | `api_key` | Optional. If set, clients must present this key or the request is rejected with `401`. Omit or set to `null` to disable auth. |
 
 ### API Key Auth
@@ -72,6 +74,17 @@ curl -X POST http://localhost:9000/v1/chat/completions \
 
 Backends are tried **in order** — list your preferred server first.
 
+### Sticky Failover
+
+To avoid wasting time on a server you already know is down (e.g. a desktop that's usually off), the router keeps a short memory of connection failures:
+
+- When a backend fails with a **connection-level error** (connection refused or connect timeout), it is marked **down** and skipped for `cooldown_seconds` (default 300s / 5 min).
+- Requests go straight to the next backend in the list while it's down.
+- The moment a backend responds successfully, its down status is cleared immediately — so if the machine comes back on, it's used again on the very next request.
+- After the cooldown expires, the backend is retried automatically.
+
+Only connection-level failures trigger the cooldown. HTTP errors and read timeouts (a slow but running server) do **not** mark a backend down. The `/health` endpoint reports each backend's `in_cooldown` state, and the diagnostic endpoints (`/v1/models`, `/router/models`) always probe every backend regardless of cooldown.
+
 ### Environment Variable Overrides (optional)
 
 You can override any config value without touching `config.json` by setting environment variables:
@@ -84,6 +97,7 @@ You can override any config value without touching `config.json` by setting envi
 | `BACKEND_1_MODEL_OVERRIDE` | Model override for backend 1 | `your-fallback-model` |
 | `CONNECT_TIMEOUT_SECONDS` | TCP connect timeout (keep low for fast failover) | `1` |
 | `READ_TIMEOUT_SECONDS` | Read/inference timeout (LLM can take minutes) | `300` |
+| `COOLDOWN_SECONDS` | How long to skip a backend after a connection failure | `300` |
 | `ROUTER_API_KEY` | Override the `api_key` from config (useful for keeping the secret out of the JSON) | `your-secret-key` |
 
 Index matches the order in `config.json`. Unset vars fall back to the JSON values.

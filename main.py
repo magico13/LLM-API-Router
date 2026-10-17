@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import secrets
+import time
 from pathlib import Path
 
 import httpx
@@ -36,6 +37,7 @@ class RouterConfig(BaseModel):
     backends: list[BackendServer]
     connect_timeout_seconds: float = 1.0
     read_timeout_seconds: float = 300.0
+    cooldown_seconds: float = 300.0
     api_key: str | None = None
 
 
@@ -75,6 +77,8 @@ def load_config() -> RouterConfig:
         cfg.connect_timeout_seconds = float(os.environ["CONNECT_TIMEOUT_SECONDS"])
     if os.getenv("READ_TIMEOUT_SECONDS"):
         cfg.read_timeout_seconds = float(os.environ["READ_TIMEOUT_SECONDS"])
+    if os.getenv("COOLDOWN_SECONDS"):
+        cfg.cooldown_seconds = float(os.environ["COOLDOWN_SECONDS"])
     if os.getenv("ROUTER_API_KEY"):
         cfg.api_key = os.environ["ROUTER_API_KEY"]
         logger.info("Overriding API key via ROUTER_API_KEY env var")
@@ -86,6 +90,39 @@ def load_config() -> RouterConfig:
         ", ".join(b.name for b in _config_cache.backends),
     )
     return _config_cache
+
+
+# ---------------------------------------------------------------------------
+# Backend cooldown tracking (sticky-server behavior)
+# ---------------------------------------------------------------------------
+
+# Maps backend name -> monotonic timestamp when it was marked down.
+_down_since: dict[str, float] = {}
+
+
+def mark_backend_down(name: str) -> None:
+    """Record that *name* failed a connection-level check."""
+    _down_since[name] = time.monotonic()
+    logger.info("Marked %s as down (cooldown %ds)", name, int(load_config().cooldown_seconds))
+
+
+def clear_backend_down(name: str) -> None:
+    """Clear the down status for *name* (it responded successfully)."""
+    if name in _down_since:
+        del _down_since[name]
+        logger.info("Cleared down status for %s", name)
+
+
+def is_backend_down(name: str) -> bool:
+    """Return True if *name* is in its cooldown window."""
+    since = _down_since.get(name)
+    if since is None:
+        return False
+    if time.monotonic() - since >= load_config().cooldown_seconds:
+        # Cooldown expired — remove the stale entry and allow the retry.
+        del _down_since[name]
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +311,10 @@ async def route_request(
 ) -> tuple[StreamingResponse | JSONResponse, BackendServer]:
     """Try backends in priority order until one succeeds.
 
+    Backends currently in cooldown are skipped. Connection-level failures
+    (refused, connect timeout) mark the backend as down for the cooldown
+    period. A successful response clears the down status immediately.
+
     Returns (response_object, backend_that_succeeded).
     On total failure returns a 503 JSONResponse and None as the backend.
     """
@@ -281,6 +322,10 @@ async def route_request(
     errors: list[str] = []
 
     for backend in cfg.backends:
+        if is_backend_down(backend.name):
+            logger.debug("Skipping %s (in cooldown)", backend.name)
+            continue
+
         logger.info("Trying %s (%s) …", backend.name, backend.url)
         try:
             if streaming:
@@ -309,6 +354,7 @@ async def route_request(
                 status, headers, content = await proxy_non_streaming(client, backend, body)
 
                 if status == 200:
+                    clear_backend_down(backend.name)
                     # Drop headers that FastAPI will recompute (content-length, transfer-encoding)
                     resp_headers = {
                         k: v for k, v in headers.items()
@@ -327,12 +373,18 @@ async def route_request(
                     errors.append(f"{backend.name}: HTTP {status}")
                     logger.warning("%s returned HTTP %d", backend.name, status)
 
-        except httpx.TimeoutException:
-            errors.append(f"{backend.name}: timeout")
-            logger.warning("Timeout connecting to %s", backend.name)
         except httpx.ConnectError as exc:
+            mark_backend_down(backend.name)
             errors.append(f"{backend.name}: connection refused ({exc})")
             logger.warning("Cannot connect to %s — %s", backend.name, exc)
+        except httpx.ConnectTimeout:
+            mark_backend_down(backend.name)
+            errors.append(f"{backend.name}: connect timeout")
+            logger.warning("Connect timeout to %s", backend.name)
+        except httpx.TimeoutException:
+            # Read/write timeout — server is up but slow; don't mark down.
+            errors.append(f"{backend.name}: timeout")
+            logger.warning("Timeout connecting to %s", backend.name)
         except httpx.HTTPStatusError as exc:
             errors.append(f"{backend.name}: {exc}")
             logger.warning("HTTP error from %s — %s", backend.name, exc)
@@ -340,7 +392,7 @@ async def route_request(
             errors.append(f"{backend.name}: {exc!r}")
             logger.exception("Unexpected error with %s", backend.name)
 
-    # All backends failed
+    # All backends failed (or all were in cooldown)
     logger.error("All backends unavailable: %s", "; ".join(errors))
     return (
         JSONResponse(
@@ -364,6 +416,9 @@ async def _stream_with_failover(
 ):
     """Async generator that tries streaming from *start_idx* onward.
 
+    Skips backends currently in cooldown. Connection-level failures mark the
+    backend as down; a successful stream clears the down status.
+
     Manages its own httpx client so it stays alive for the full stream lifetime.
     """
     client_kwargs = {"verify": False}
@@ -373,15 +428,24 @@ async def _stream_with_failover(
     async with httpx.AsyncClient(**client_kwargs) as client:
         for i in range(start_idx, len(backends)):
             backend = backends[i]
+            if is_backend_down(backend.name):
+                logger.debug("Skipping %s (in cooldown)", backend.name)
+                continue
+
             logger.info("Streaming from %s (%s) …", backend.name, backend.url)
             try:
                 async for chunk in proxy_streaming(client, backend, body):
                     yield chunk
+                clear_backend_down(backend.name)
                 return  # success — exit
+            except httpx.ConnectError as exc:
+                mark_backend_down(backend.name)
+                logger.warning("Cannot connect to %s (%s), trying next …", backend.name, exc)
+            except httpx.ConnectTimeout:
+                mark_backend_down(backend.name)
+                logger.warning("Connect timeout to %s, trying next …", backend.name)
             except httpx.TimeoutException:
                 logger.warning("Timeout streaming from %s, trying next …", backend.name)
-            except httpx.ConnectError as exc:
-                logger.warning("Cannot connect to %s (%s), trying next …", backend.name, exc)
             except httpx.HTTPStatusError as exc:
                 logger.warning("HTTP error streaming from %s (%s), trying next …", backend.name, exc)
             except Exception as exc:
@@ -518,7 +582,12 @@ async def health():
     return {
         "status": "ok",
         "backends": [
-            {"name": b.name, "url": b.url, "model_override": b.model_override}
+            {
+                "name": b.name,
+                "url": b.url,
+                "model_override": b.model_override,
+                "in_cooldown": is_backend_down(b.name),
+            }
             for b in cfg.backends
         ],
     }
