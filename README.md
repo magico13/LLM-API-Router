@@ -43,7 +43,8 @@ Edit [`data/config.json`](data/config.json):
   "connect_timeout_seconds": 1,
   "read_timeout_seconds": 300,
   "cooldown_seconds": 300,
-  "api_key": "your-secret-key"
+  "api_keys": ["your-secret-key"],
+  "no_thinking_api_keys": ["your-no-thinking-key"]
 }
 ```
 
@@ -55,11 +56,12 @@ Edit [`data/config.json`](data/config.json):
 | `connect_timeout_seconds` | How long to wait for TCP connection before failing over (keep low — 1s is fine) |
 | `read_timeout_seconds` | How long to wait after connecting for the response (LLM inference can take minutes) |
 | `cooldown_seconds` | How long to skip a backend after a connection-level failure before retrying it (see [Sticky failover](#sticky-failover)) |
-| `api_key` | Optional. If set, clients must present this key or the request is rejected with `401`. Omit or set to `null` to disable auth. |
+| `api_keys` | Optional. List of API keys that grant normal access (reasoning pass-through). If both `api_keys` and `no_thinking_api_keys` are empty, auth is disabled. |
+| `no_thinking_api_keys` | Optional. List of API keys that grant access **with reasoning/thinking forced off** for every request. Useful for clients (e.g. game mods) that can't control the reasoning fields themselves. |
 
 ### API Key Auth
 
-When `api_key` is set, every request to `/v1/chat/completions`, `/v1/models`, and `/router/models` must present the key. The `/health` endpoint stays open for liveness probes.
+When any API keys are configured, every request to `/v1/chat/completions`, `/v1/models`, and `/router/models` must present one of them. The `/health` endpoint stays open for liveness probes.
 
 The key is read from the `Authorization: Bearer <key>` header (standard for OpenAI-compatible clients) or, as a fallback, the `?api_key=<key>` query string.
 
@@ -71,6 +73,12 @@ curl -X POST http://localhost:9000/v1/chat/completions \
 ```
 
 > **Note:** This is a simple shared-secret gate, not a full auth system. It's fine for keeping casual strangers out of a home network, but if you expose the router to the public internet, put it behind a reverse proxy with TLS (and consider a stronger auth layer).
+
+#### No-thinking keys
+
+Keys in `no_thinking_api_keys` work like normal keys, but the router forces reasoning/thinking **off** for every request they authenticate with — regardless of what the client sends. This is applied per-request (not per-backend), so failover works as usual.
+
+Use case: a client (e.g. a game mod) that lets you pick the server and API key but can't set the reasoning fields itself. Give it a no-thinking key and it will always get non-reasoning responses, while your other keys keep normal pass-through behavior.
 
 Backends are tried **in order** — list your preferred server first.
 
@@ -98,7 +106,8 @@ You can override any config value without touching `config.json` by setting envi
 | `CONNECT_TIMEOUT_SECONDS` | TCP connect timeout (keep low for fast failover) | `1` |
 | `READ_TIMEOUT_SECONDS` | Read/inference timeout (LLM can take minutes) | `300` |
 | `COOLDOWN_SECONDS` | How long to skip a backend after a connection failure | `300` |
-| `ROUTER_API_KEY` | Override the `api_key` from config (useful for keeping the secret out of the JSON) | `your-secret-key` |
+| `ROUTER_API_KEYS` | Override the `api_keys` from config (comma-separated, useful for keeping secrets out of the JSON) | `key1,key2` |
+| `NO_THINKING_API_KEYS` | Override the `no_thinking_api_keys` from config (comma-separated) | `mod-key-1,mod-key-2` |
 
 Index matches the order in `config.json`. Unset vars fall back to the JSON values.
 
@@ -145,7 +154,7 @@ In your `configuration.yaml`, point the OpenAI integration at the router:
 ```yaml
 conversation:
   - platform: openai_conversation
-    api_key: "your-secret-key"     # the router's api_key (required when auth is enabled)
+    api_key: "your-secret-key"     # one of the router's api_keys (required when auth is enabled)
     model: "any"                   # overridden by the router per-backend
 ```
 
@@ -158,7 +167,7 @@ from openai import OpenAI
 
 client = OpenAI(
     base_url="http://localhost:9000/v1",
-    api_key="your-secret-key"      # the router's api_key (required when auth is enabled)
+    api_key="your-secret-key"      # one of the router's api_keys (required when auth is enabled)
 )
 
 response = client.chat.completions.create(

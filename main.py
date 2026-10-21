@@ -38,7 +38,8 @@ class RouterConfig(BaseModel):
     connect_timeout_seconds: float = 1.0
     read_timeout_seconds: float = 300.0
     cooldown_seconds: float = 300.0
-    api_key: str | None = None
+    api_keys: list[str] = []
+    no_thinking_api_keys: list[str] = []
 
 
 # ---------------------------------------------------------------------------
@@ -79,9 +80,12 @@ def load_config() -> RouterConfig:
         cfg.read_timeout_seconds = float(os.environ["READ_TIMEOUT_SECONDS"])
     if os.getenv("COOLDOWN_SECONDS"):
         cfg.cooldown_seconds = float(os.environ["COOLDOWN_SECONDS"])
-    if os.getenv("ROUTER_API_KEY"):
-        cfg.api_key = os.environ["ROUTER_API_KEY"]
-        logger.info("Overriding API key via ROUTER_API_KEY env var")
+    if os.getenv("ROUTER_API_KEYS"):
+        cfg.api_keys = [k.strip() for k in os.environ["ROUTER_API_KEYS"].split(",") if k.strip()]
+        logger.info("Overriding API keys via ROUTER_API_KEYS env var")
+    if os.getenv("NO_THINKING_API_KEYS"):
+        cfg.no_thinking_api_keys = [k.strip() for k in os.environ["NO_THINKING_API_KEYS"].split(",") if k.strip()]
+        logger.info("Overriding no-thinking API keys via NO_THINKING_API_KEYS env var")
 
     _config_cache = cfg
     logger.info(
@@ -138,17 +142,35 @@ def _extract_api_key(request: Request) -> str | None:
     return request.query_params.get("api_key")
 
 
-async def require_api_key(request: Request):
-    """Reject the request unless the API key matches the configured one.
+def _classify_api_key(provided: str | None) -> str | None:
+    """Classify a provided key as ``"normal"``, ``"no_thinking"``, or ``None``.
 
-    If no API key is configured, all requests are allowed.
+    Uses constant-time comparison against each configured key. A key in
+    ``no_thinking_api_keys`` forces reasoning off for that request.
+    """
+    if provided is None:
+        return None
+    cfg = load_config()
+    for key in cfg.api_keys:
+        if secrets.compare_digest(provided, key):
+            return "normal"
+    for key in cfg.no_thinking_api_keys:
+        if secrets.compare_digest(provided, key):
+            return "no_thinking"
+    return None
+
+
+async def require_api_key(request: Request):
+    """Reject the request unless the API key matches a configured key.
+
+    If no API keys are configured, all requests are allowed.
     """
     cfg = load_config()
-    if not cfg.api_key:
+    if not cfg.api_keys and not cfg.no_thinking_api_keys:
         return
 
     provided = _extract_api_key(request)
-    if provided is None or not secrets.compare_digest(provided, cfg.api_key):
+    if _classify_api_key(provided) is None:
         logger.warning(
             "Rejected request to %s — missing or invalid API key", request.url.path
         )
@@ -237,10 +259,21 @@ def normalize_reasoning(body: dict) -> dict:
 
 def apply_overrides(body: dict, backend: BackendServer) -> dict:
     """Return a copy of the request body with per-server overrides applied."""
+    force_no_thinking = body.get("_force_no_thinking", False)
     patched = {k: v for k, v in body.items() if not k.startswith("_")}
     if backend.model_override:
         patched["model"] = backend.model_override
     patched = normalize_reasoning(patched)
+
+    if force_no_thinking:
+        kwargs = patched.get("chat_template_kwargs")
+        if not isinstance(kwargs, dict):
+            kwargs = {}
+        kwargs["enable_thinking"] = False
+        patched["chat_template_kwargs"] = kwargs
+        patched.pop("reasoning_effort", None)
+        patched.pop("reasoning_budget_tokens", None)
+
     return patched
 
 
@@ -468,13 +501,16 @@ async def chat_completions(request: Request):
     body = await request.json()
     streaming = body.get("stream", False)
 
+    # Classify the API key to determine if thinking should be forced off.
+    provided_key = _extract_api_key(request)
+    key_class = _classify_api_key(provided_key)
+    if key_class == "no_thinking":
+        body["_force_no_thinking"] = True
+
     # Don't forward the router's own API key to the backends — only pass
     # through Authorization headers meant for the backend itself.
     auth_header = request.headers.get("authorization")
-    cfg = load_config()
-    if cfg.api_key and auth_header and secrets.compare_digest(
-        auth_header.removeprefix("Bearer ").strip(), cfg.api_key
-    ):
+    if auth_header and key_class is not None:
         auth_header = None
     extra_headers = {}
     if auth_header:
